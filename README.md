@@ -1,32 +1,17 @@
-# Al Ameen Abdul Aleem
+# Hi, I'm Al Ameen 👋
 
-**Computer science student · Machine learning · Natural language processing**
+I’m a hands-on builder exploring AI, automation, and tools that make everyday tasks easier.
 
-I explore machine learning and language models through hands-on Python projects. My work covers text classification, retrieval-augmented generation, and the foundations of the Transformer architecture.
+## What I do
 
-[LinkedIn](https://www.linkedin.com/in/alameen2301) · [Explore my repositories](https://github.com/Alameen-2301?tab=repositories)
+I turn ideas into practical tools, experiment with AI, and explore ways to connect different technologies.
 
-## Selected projects
+## How I work
 
-| Project | What it explores | Tools |
-| --- | --- | --- |
-| [RAG Chatbot](https://github.com/Alameen-2301/rag-chatbot) | A Streamlit app that retrieves PDF passages and uses a local language model to answer questions. | LangChain, FAISS, Sentence Transformers, Ollama |
-| [News Classifier](https://github.com/Alameen-2301/news-classifier) | Fine-tuning BERT on an AG News subset for four-category classification. | PyTorch, Hugging Face Transformers, Datasets |
-| [Sentiment Analyzer](https://github.com/Alameen-2301/sentiment-analyzer) | Exploring positive and negative sentiment predictions with a pretrained Transformer pipeline. | Python, Hugging Face Transformers |
-| [Transformer Paper Notes](https://github.com/Alameen-2301/transformer-paper-notes) | Study notes on attention, encoder–decoder architecture, and positional encoding. | Paper reading, deep learning fundamentals |
+- **Learn by building.** I try ideas, test them, and improve as I go.
+- **Start with a problem.** I focus on things that would be useful in everyday life.
+- **Keep things flexible.** I value choice and control over the tools I use.
+- **Question the results.** I want to understand what works, what doesn’t, and why.
+- **Keep improving.** Feedback and real-world use guide my next steps.
 
-## Technical toolkit
-
-- **Language:** Python
-- **Machine learning:** PyTorch, Hugging Face Transformers, scikit-learn
-- **Data:** NumPy, pandas
-- **LLM applications:** LangChain, FAISS, Sentence Transformers, Ollama
-- **Interfaces:** Streamlit
-
-## Learning focus
-
-I'm deepening my understanding of neural networks, Transformer architectures, and the evaluation of NLP systems. These repositories document that learning through small, focused implementations and written explanations.
-
-## Connect
-
-Find me on [LinkedIn](https://www.linkedin.com/in/alameen2301).
+Always curious. Always learning. Always building.
