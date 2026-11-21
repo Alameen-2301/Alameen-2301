@@ -9,9 +9,19 @@ set -euo pipefail
 cd /kaggle/working
 
 if [ ! -x llama.cpp/build/bin/llama-bench ]; then
-  git clone --depth 1 https://github.com/ggml-org/llama.cpp
+  [ -d llama.cpp ] || git clone --depth 1 https://github.com/ggml-org/llama.cpp
+  rm -rf llama.cpp/build
+  # Kaggle ships the driver only as libcuda.so.1 (or a stub), which CMake's
+  # FindCUDAToolkit does not find on its own -> point it at the library.
+  LIBCUDA=$(ls /usr/local/cuda/lib64/stubs/libcuda.so \
+               /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so \
+               /usr/lib/x86_64-linux-gnu/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so.1 \
+               /usr/local/nvidia/lib64/libcuda.so.1 2>/dev/null | head -1)
+  echo "libcuda: $LIBCUDA"
   cmake -S llama.cpp -B llama.cpp/build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 \
-        -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release > build.log 2>&1
+        -DCUDA_cuda_driver_LIBRARY="$LIBCUDA" -DGGML_CCACHE=OFF \
+        -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release > build.log 2>&1 \
+    || { tail -30 build.log; exit 1; }
   cmake --build llama.cpp/build -j4 --target llama-bench llama-cli >> build.log 2>&1
 fi
 llama.cpp/build/bin/llama-bench --version 2>&1 | head -2 || true
