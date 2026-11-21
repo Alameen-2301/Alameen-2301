@@ -1,0 +1,10 @@
+# python prune_eval.py Qwen/Qwen2.5-{0.5B,1.5B,7B}   (Kaggle 2x Tesla T4, fp16)
+Qwen/Qwen2.5-0.5B: 0.49B params, eval 20480 tokens
+baseline 0% 16.52 1.00x | magnitude 25% 22.07 1.34x | wanda 25% 17.18 1.04x
+magnitude 50% 525.13 31.79x | wanda 50% 27.77 1.68x | wanda 2:4 88.63 5.37x
+Qwen/Qwen2.5-1.5B: 1.54B params, eval 20480 tokens
+baseline 0% 11.54 1.00x | magnitude 25% 14.44 1.25x | wanda 25% 11.96 1.04x
+magnitude 50% 92.66 8.03x | wanda 50% 17.60 1.52x | wanda 2:4 45.09 3.91x
+Qwen/Qwen2.5-7B: 7.62B params, eval 20480 tokens
+baseline 0% 7.77 1.00x | magnitude 25% 12.78 1.64x | wanda 25% 8.05 1.04x
+magnitude 50% 668.37 86.00x | wanda 50% 10.20 1.31x | wanda 2:4 17.41 2.24x
