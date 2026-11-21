@@ -479,6 +479,30 @@ def perplexity(model, tok, windows, seq=512):
     return float(torch.exp(torch.tensor(nll / n)))
 
 
+@torch.no_grad()
+def bench_with_len(model, tok, gen):
+    ids = tok([PROMPT], return_tensors="pt").to(DEV)
+    torch.cuda.synchronize()
+    t = time.time()
+    out = model.generate(**ids, max_new_tokens=gen, min_new_tokens=gen, do_sample=False)
+    torch.cuda.synchronize()
+    return time.time() - t, out
+
+
+@torch.no_grad()
+def bench_spec(model, draft, tok, gen):
+    """Speculative decoding: the small draft model (fully on the GPU) proposes
+    tokens, the big streamed model verifies them all in one pass. Greedy, so
+    the output must equal plain greedy decoding of the big model."""
+    ids = tok([PROMPT], return_tensors="pt").to(DEV)
+    torch.cuda.synchronize()
+    t = time.time()
+    out = model.generate(**ids, assistant_model=draft, max_new_tokens=gen, min_new_tokens=gen,
+                         do_sample=False)
+    torch.cuda.synchronize()
+    return time.time() - t, out
+
+
 def main():
     if MODE == "selftest":
         selftest()
@@ -486,13 +510,42 @@ def main():
     tok = AutoTokenizer.from_pretrained(MODEL)
     print(f"PCIe host->GPU: {pcie_bw():.1f} GB/s", flush=True)
     t = time.time()
-    model, info = build_accel(FRAC) if MODE == "accel" else build(MODE, FRAC)
+    spec = os.environ.get("SPEC")  # e.g. Qwen/Qwen2.5-0.5B (must share the tokenizer)
+    draft = None
+    frac = FRAC
+    if spec:
+        draft = AutoModelForCausalLM.from_pretrained(spec, dtype=torch.float16).to(DEV).eval()
+        dbytes = sum(p.numel() for p in draft.parameters()) * 2
+        # the draft model's memory comes out of the same GPU budget
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(MODEL)
+        approx_total = 2 * (cfg.vocab_size * cfg.hidden_size * (1 if cfg.tie_word_embeddings else 2)
+                            + cfg.num_hidden_layers * (4 * cfg.hidden_size ** 2
+                                                       + 3 * cfg.hidden_size * cfg.intermediate_size))
+        frac = max(0.0, FRAC - dbytes / approx_total)
+        print(f"draft model {spec}: {dbytes / GB:.2f} GB on GPU; big-model budget "
+              f"{FRAC:.2f} -> {frac:.3f} of its size", flush=True)
+    model, info = build_accel(frac) if MODE == "accel" else build(MODE, frac)
     torch.cuda.synchronize()
     info["build_s"] = round(time.time() - t)
     info["gpu_alloc_gb"] = torch.cuda.memory_allocated(DEV) / GB
     print(MODE, json.dumps({k: round(v, 2) if isinstance(v, float) else v for k, v in info.items()}),
           flush=True)
     bench(model, tok, 1)  # warmup
+    if draft is not None:
+        gen = int(os.environ.get("GEN", "64"))
+        dt0, ref = bench_with_len(model, tok, gen)
+        print(f"{MODE} plain   batch=1: {gen} tokens in {dt0:6.1f}s -> {gen / dt0:6.2f} tokens/s",
+              flush=True)
+        torch.cuda.reset_peak_memory_stats(DEV)
+        dt1, out = bench_spec(model, draft, tok, gen)
+        peak = torch.cuda.max_memory_allocated(DEV) / GB
+        same = torch.equal(out[0][:ref.shape[1]], ref[0])
+        print(f"{MODE} +spec  batch=1: {gen} tokens in {dt1:6.1f}s -> {gen / dt1:6.2f} tokens/s "
+              f"({dt0 / dt1:.2f}x), identical to plain greedy: {same}, peak GPU {peak:.2f} GB",
+              flush=True)
+        print("sample:", repr(tok.decode(out[0][-gen:])[:200]))
+        return
     for b in BATCHES:
         torch.cuda.reset_peak_memory_stats(DEV)
         dt, out = bench(model, tok, b)
