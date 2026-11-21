@@ -3,16 +3,26 @@ decoder layers from pinned CPU RAM, with prefetch overlap and optional
 lossless compression (decoded on the GPU).
 
     python offload_bench.py MODEL BUDGET_FRAC MODE [BATCH ...]
-      MODE: raw   stream fp16 weights (2 bytes/weight over PCIe)
-            comp  stream lossless 12-bit format (exponent code + sign/mantissa)
-            accel Hugging Face accelerate offload (device_map + max_memory)
+      MODE: raw       stream fp16 weights (2 bytes/weight over PCIe)
+            comp      stream lossless 12-bit format (exponent code + sign/mantissa)
+            sparseNN  Wanda-prune NN% of each linear's weights, then stream a
+                      1-bit keep-bitmap + only the kept weights in the 12-bit
+                      format (needs norms from calib_norms.py)
+            accel     Hugging Face accelerate offload (device_map + max_memory)
+    python offload_bench.py --selftest      bit-exactness tests of both codecs
+
+    env PPL_WINDOWS=N  also measure WikiText-2 perplexity through the engine
 """
-import sys, time, gc, json
+import os, sys, time, gc, json
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL, FRAC, MODE = sys.argv[1], float(sys.argv[2]), sys.argv[3]
-BATCHES = [int(b) for b in sys.argv[4:]] or [1, 16]
+if sys.argv[1:2] != ["--selftest"]:
+    MODEL, FRAC, MODE = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+    BATCHES = [int(b) for b in sys.argv[4:]] or [1, 16]
+else:
+    MODEL, FRAC, MODE, BATCHES = None, 0, "selftest", []
+PRUNE = int(MODE[6:]) / 100 if MODE.startswith("sparse") else 0.0
 DEV = torch.device("cuda:0")
 GEN, PROMPT = 32, "The history of the transistor begins"
 GB = 1 << 30
@@ -72,6 +82,129 @@ def decompress_into(c, out: torch.Tensor):
         bits = (c["esc_v"] << 7) | (smv & 0x7F)
         bits = torch.where(smv >= 128, bits | -32768, bits)
         flat[i] = bits.view(torch.bfloat16).to(torch.float16)
+
+
+SBLOCK = 1024  # elements per sparse-decode program (one block-offset entry each)
+
+
+def compress_sparse(t: torch.Tensor):
+    """bf16 tensor with pruned (zero) weights -> bitmap + kept weights.
+
+    bitmap   1 bit per weight (1 = kept), little-endian within each byte
+    boff     int32 per SBLOCK: index of the block's first kept weight
+    sm/packed/lut  the 12-bit lossless format, over kept weights only
+    esc_pos/esc_bits  kept weights whose exponent has no 4-bit code, stored
+                      as (dense position, exact bf16 bits)
+    Exact: zeros are restored as +0.0 only where the bits were 0x0000.
+    """
+    u = t.contiguous().view(torch.int16).flatten()
+    n = u.numel()
+    keep = u != 0
+    pad = (-n) % 8
+    kb = torch.cat([keep, keep.new_zeros(pad)]).view(-1, 8).to(torch.uint8)
+    bitmap = (kb << torch.arange(8, dtype=torch.uint8)).sum(1, dtype=torch.uint8)
+    nb = (n + SBLOCK - 1) // SBLOCK
+    per = torch.nn.functional.pad(keep, (0, nb * SBLOCK - n)).view(nb, SBLOCK).sum(1)
+    boff = torch.cumsum(per, 0) - per
+    kept = u[keep]
+    exp = ((kept >> 7) & 0xFF).to(torch.uint8)
+    sm = (((kept >> 8) & 0x80) | (kept & 0x7F)).to(torch.uint8)
+    cnt = torch.bincount(exp.long(), minlength=256)
+    top = cnt.argsort(descending=True)[:15]
+    code_of = torch.full((256,), 15, dtype=torch.uint8)
+    code_of[top] = torch.arange(15, dtype=torch.uint8)
+    codes = code_of[exp.long()]
+    if codes.numel() % 2:
+        codes = torch.cat([codes, codes.new_zeros(1)])
+    packed = codes[0::2] | (codes[1::2] << 4)
+    lut = torch.zeros(16, dtype=torch.int16)
+    lut[:15] = top.to(torch.int16)
+    esc_k = (code_of[exp.long()] == 15).nonzero().flatten()
+    esc_pos = keep.nonzero().flatten()[esc_k]
+    return dict(n=n, bitmap=bitmap, boff=boff.to(torch.int32), sm=sm, packed=packed,
+                lut=lut, esc_pos=esc_pos.to(torch.int32), esc_bits=kept[esc_k])
+
+
+@triton.jit
+def _sparse_decode_kernel(bitmap, boff, packed, sm, lut, out, n, BLOCK: tl.constexpr):
+    """bitmap + kept weights -> dense fp16. A running count (cumsum) of the
+    bitmap inside the block gives each kept weight's index."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    byte = tl.load(bitmap + offs // 8, mask=m, other=0).to(tl.int32)
+    bit = (byte >> (offs % 8)) & 1
+    k = tl.load(boff + pid) + tl.cumsum(bit, 0) - 1
+    keep = (bit == 1) & m
+    pk = tl.load(packed + k // 2, mask=keep, other=0).to(tl.int32)
+    code = tl.where(k % 2 == 0, pk & 15, pk >> 4)
+    exp = tl.load(lut + code, mask=keep, other=0).to(tl.int32)
+    s = tl.load(sm + k, mask=keep, other=0).to(tl.int32)
+    bits = ((s & 0x80) << 8) | (exp << 7) | (s & 0x7F)
+    f = (bits << 16).to(tl.float32, bitcast=True).to(tl.float16)
+    tl.store(out + offs, tl.where(keep, f, 0.0), mask=m)
+
+
+def sparse_decode(parts, out):
+    """parts: GPU tensors bitmap, boff, packed, sm, lut, esc_pos, esc_bits."""
+    n = out.numel()
+    _sparse_decode_kernel[(triton.cdiv(n, SBLOCK),)](
+        parts["bitmap"], parts["boff"], parts["packed"], parts["sm"], parts["lut"],
+        out, n, BLOCK=SBLOCK)
+    if parts["esc_pos"].numel():
+        out[parts["esc_pos"].long()] = parts["esc_bits"].view(torch.bfloat16).to(torch.float16)
+
+
+# blob layout: every part 16-byte aligned, in this order
+SPARSE_PARTS = [("bitmap", torch.uint8), ("boff", torch.int32), ("sm", torch.uint8),
+                ("packed", torch.uint8), ("esc_pos", torch.int32), ("esc_bits", torch.int16)]
+
+
+def pack_blob(c, parts):
+    offs, o = {}, 0
+    for name, dt in parts:
+        nbytes = c[name].numel() * c[name].element_size()
+        offs[name] = (o, c[name].numel(), dt)
+        o = _align(o + nbytes)
+    blob = torch.zeros(o, dtype=torch.uint8).pin_memory()
+    for name, dt in parts:
+        s, cnt, _ = offs[name]
+        blob[s:s + cnt * c[name].element_size()] = c[name].contiguous().view(torch.uint8)
+    return blob, offs
+
+
+def unpack_blob(st, offs):
+    return {name: st[s:s + cnt * torch.tensor([], dtype=dt).element_size()].view(dt)
+            for name, (s, cnt, dt) in offs.items()}
+
+
+def selftest():
+    """Bit-exactness of both codecs on random bf16 data with pruned zeros,
+    signed zeros and rare exponents."""
+    torch.manual_seed(0)
+    for n in (1, 7, 1023, 1024, 1025, 5_000_003):
+        x = (torch.randn(n) * 0.02).to(torch.bfloat16)
+        x[torch.rand(n) < 0.5] = 0                        # pruned
+        if n > 10:
+            x[3] = -0.0                                   # must survive as -0.0
+            x[5] = 3.0e4                                  # rare exponent -> escape
+            x[9] = 1e-30
+        ref = x.to(torch.float16)
+        c = compress_sparse(x)
+        g = {k: (v.to(DEV) if torch.is_tensor(v) else v) for k, v in c.items()}
+        g["lut"] = c["lut"].to(DEV)
+        out = torch.empty(n, dtype=torch.float16, device=DEV)
+        sparse_decode(g, out)
+        ok = torch.equal(out.cpu().view(torch.int16), ref.view(torch.int16))
+        kept = int((x.view(torch.int16) != 0).sum())
+        print(f"sparse codec n={n:>9,}: {'BIT-EXACT' if ok else 'MISMATCH'}  "
+              f"kept {kept:,}, {sum(v.numel() * v.element_size() for k, v in c.items() if torch.is_tensor(v)) * 8 / n:.2f} bits/weight")
+        assert ok
+        d = compress(x)
+        out2 = torch.empty(n, dtype=torch.float16, device=DEV)
+        decompress_into({k: (v.to(DEV) if torch.is_tensor(v) else v) for k, v in d.items()}, out2)
+        assert torch.equal(out2.cpu().view(torch.int16), ref.view(torch.int16)), "dense codec"
+    print("dense codec: BIT-EXACT on all sizes")
 
 
 def decompress_into_torch(c, out: torch.Tensor):
@@ -135,7 +268,13 @@ class Streamer:
         self.host, self.meta, self.luts = {}, {}, {}
         for li in streamed:
             flat = torch.cat([p.data.flatten() for _, p in layers[li].named_parameters()])
-            if mode == "comp":
+            if mode.startswith("sparse"):
+                c = compress_sparse(flat)
+                blob, offs = pack_blob(c, SPARSE_PARTS)
+                self.host[li] = blob
+                self.meta[li] = offs
+                self.luts[li] = c["lut"].to(DEV)
+            elif mode == "comp":
                 c = compress(flat)
                 n_sm, n_pk = c["n"], c["packed"].numel()
                 n_esc = c["esc_i"].numel()
@@ -158,7 +297,7 @@ class Streamer:
             del flat
             gc.collect()
         self.flat = [torch.empty(self.n, dtype=torch.float16, device=DEV) for _ in range(2)]
-        if mode == "comp":
+        if mode != "raw":
             mx = max(b.numel() for b in self.host.values())
             self.stage = [torch.empty(mx, dtype=torch.uint8, device=DEV) for _ in range(2)]
         self.views = [[f[o:o + (int(torch.tensor(sh).prod()) if sh else 1)].view(sh)
@@ -177,7 +316,14 @@ class Streamer:
     def prefetch(self, li, slot):
         self.copy.wait_stream(torch.cuda.current_stream(DEV))  # slot is free
         with torch.cuda.stream(self.copy):
-            if self.mode == "comp":
+            if self.mode.startswith("sparse"):
+                blob = self.host[li]
+                st = self.stage[slot][:blob.numel()]
+                st.copy_(blob, non_blocking=True)
+                parts = unpack_blob(st, self.meta[li])
+                parts["lut"] = self.luts[li]
+                sparse_decode(parts, self.flat[slot])
+            elif self.mode == "comp":
                 blob = self.host[li]
                 st = self.stage[slot][:blob.numel()]
                 st.copy_(blob, non_blocking=True)
@@ -214,9 +360,40 @@ class Streamer:
         return out
 
 
+def norms_path():
+    return f"norms_{MODEL.split('/')[-1]}.pt"
+
+
+@torch.no_grad()
+def wanda_prune(model, frac):
+    """Zero the `frac` lowest |w|*||x|| weights in each output row of every
+    linear layer inside the decoder blocks (same rule as prune_eval.py).
+    Done one weight at a time on the GPU, results written back to CPU bf16."""
+    norms = torch.load(norms_path())
+    for name, m in model.model.layers.named_modules():
+        if not isinstance(m, torch.nn.Linear):
+            continue
+        W = m.weight.data
+        k = int(W.shape[1] * frac)
+        nrm = norms[name].to(DEV)
+        for r in range(0, W.shape[0], 2048):
+            w = W[r:r + 2048].to(DEV)
+            score = w.float().abs() * nrm[None, :]
+            thr = score.kthvalue(k, dim=1, keepdim=True).values
+            w[score <= thr] = 0
+            W[r:r + 2048] = w.cpu()
+        del nrm
+    torch.cuda.empty_cache()
+
+
 def build(mode, frac):
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16,
                                                  low_cpu_mem_usage=True).eval()
+    if PRUNE:
+        t = time.time()
+        wanda_prune(model, PRUNE)
+        print(f"wanda-pruned {PRUNE:.0%} of block linear weights in {time.time() - t:.0f}s",
+              flush=True)
     total_bytes = sum(p.numel() for p in model.parameters()) * 2
     budget = frac * total_bytes
     layers = model.model.layers
@@ -284,7 +461,28 @@ def pcie_bw():
     return 5 * x.numel() / (time.time() - t) / GB
 
 
+@torch.no_grad()
+def perplexity(model, tok, windows, seq=512):
+    """WikiText-2 test perplexity computed *through the streaming engine*
+    (same text and windowing as prune_eval.py)."""
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+    p = hf_hub_download("Salesforce/wikitext", "wikitext-2-raw-v1/test-00000-of-00001.parquet",
+                        repo_type="dataset")
+    ids = tok("\n\n".join(pq.read_table(p).column("text").to_pylist()),
+              return_tensors="pt").input_ids
+    nll, n = 0.0, 0
+    for k in range(windows):
+        x = ids[:, k * seq:(k + 1) * seq].to(DEV)
+        nll += model(x, labels=x).loss.float().item() * (x.shape[1] - 1)
+        n += x.shape[1] - 1
+    return float(torch.exp(torch.tensor(nll / n)))
+
+
 def main():
+    if MODE == "selftest":
+        selftest()
+        return
     tok = AutoTokenizer.from_pretrained(MODEL)
     print(f"PCIe host->GPU: {pcie_bw():.1f} GB/s", flush=True)
     t = time.time()
@@ -304,6 +502,11 @@ def main():
     text = tok.decode(out[0][-GEN:])
     torch.save(out[0].cpu(), f"tokens_{MODE}.pt")
     print("sample:", repr(text[:160]))
+    w = int(os.environ.get("PPL_WINDOWS", "0"))
+    if w:
+        t = time.time()
+        print(f"{MODE} perplexity over {w * 512} WikiText-2 tokens: {perplexity(model, tok, w):.2f} "
+              f"({time.time() - t:.0f}s)", flush=True)
 
 
 if __name__ == "__main__":
