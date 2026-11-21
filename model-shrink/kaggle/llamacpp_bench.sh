@@ -16,7 +16,7 @@ if [ ! -x llama.cpp/build/bin/llama-bench ]; then
   LIBCUDA=$(ls /usr/local/cuda/lib64/stubs/libcuda.so \
                /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so \
                /usr/lib/x86_64-linux-gnu/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so.1 \
-               /usr/local/nvidia/lib64/libcuda.so.1 2>/dev/null | head -1)
+               /usr/local/nvidia/lib64/libcuda.so.1 2>/dev/null | head -1 || true)
   echo "libcuda: $LIBCUDA"
   cmake -S llama.cpp -B llama.cpp/build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 \
         -DCUDA_cuda_driver_LIBRARY="$LIBCUDA" -DGGML_CCACHE=OFF \
