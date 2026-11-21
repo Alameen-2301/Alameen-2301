@@ -53,12 +53,75 @@ What the numbers show:
   fine-tunes).
 * **The 2:4 pattern costs much more than free-form 50% pruning** on a small
   model. It is the only pattern current GPUs accelerate, though.
-* This is a 0.5B model. Published results (SparseGPT, Wanda) show that larger
-  models tolerate pruning much better, so 50% on a 20B+ model is typically
-  far closer to the original than 1.68×. Treat these numbers as a
-  pessimistic lower bound.
+* This is a 0.5B model. Larger models tolerate pruning much better, as
+  measured below.
 
-## 3. Putting it together for a 20B model (40 GB BF16)
+### 2b. Pruning vs. model size (Kaggle T4 GPU, `kaggle/prune_eval.py`)
+
+Same method, same 20,480 WikiText-2 tokens, FP16 on GPU. Each cell is
+perplexity relative to that model's own unpruned baseline.
+
+| method | Qwen2.5-0.5B | Qwen2.5-1.5B | **Qwen2.5-7B** |
+|---|---|---|---|
+| baseline perplexity | 16.52 | 11.54 | 7.77 |
+| magnitude 25% | 1.34× | 1.25× | 1.64× |
+| **Wanda 25%** | 1.04× | 1.04× | **1.04×** |
+| magnitude 50% | 31.8× | 8.0× | 86× |
+| **Wanda 50%** | 1.68× | 1.52× | **1.31×** |
+| **Wanda 2:4** | 5.37× | 3.91× | **2.24×** |
+
+**The cost of 50% pruning drops steadily with model size** (1.68 → 1.52 → 1.31).
+At 7B, half the weights can be removed with no retraining, and the pruned
+model (perplexity 10.2) is still better than the *unpruned* 1.5B model (11.5).
+Plain magnitude pruning, by contrast, gets *less* reliable at scale: large
+models have a few huge activation outliers that the |w| × ‖x‖ score accounts for.
+
+## 3. Running a model 4× bigger than the GPU budget (Kaggle T4, `kaggle/offload_bench.py`)
+
+Qwen2.5-7B (14.2 GB in FP16) with the GPU limited to **25% of the model size
+(3.55 GB)**. That is the same ratio as a 20B model (40 GB) on a 10 GB GPU.
+Two of the 28 decoder layers stay on the GPU. The other 26 are streamed from
+pinned system RAM through two GPU slots: layer N+1 is copied in while layer N
+computes. The embedding table stays in RAM, and only the looked-up rows are sent.
+
+Compressed mode keeps each streamed layer in RAM as one 12-bit lossless blob:
+a 4-bit code for the 15 most common exponents plus the sign/mantissa byte,
+with rare exponents stored exactly in a side list. A fused Triton kernel
+decodes it on the GPU in a single pass.
+
+| engine | PCIe per token | time per step | tokens/s, batch 1 | tokens/s, batch 8 | peak GPU |
+|---|---|---|---|---|---|
+| Hugging Face `accelerate` offload (standard) | 11.3 GB | 2.97 s | 0.34 | 2.74 | 3.37 GB |
+| **ours: streaming + prefetch, FP16** | 11.29 GB | 1.055 s | 0.95 | 7.56 | 2.80 GB |
+| **ours: streaming + prefetch, lossless 12-bit** | **8.47 GB** | **0.907 s** | **1.10** | **8.81** | 3.46 GB |
+
+* **3.3× faster than the standard tool, at the same memory budget.**
+* **Lossless is verified end to end:** compressed and FP16 streaming produce
+  *identical* tokens, checked on both 0.5B and 7B.
+* **The bottleneck is purely the PCIe link.** FP16 streaming hits
+  11.29 GB ÷ 11.3 GB/s = 1.0 s per step almost exactly; prefetch hides all
+  compute. Compression cuts the bytes by 25% and the time by 14%; the gap is
+  decode overhead plus a slightly slower PCIe reading during that run.
+* **Batching is nearly free**: one pass over the weights serves the whole
+  batch, so batch 8 runs at the same step time with 8× the throughput.
+* Getting here took three rounds. Plain PyTorch decode ops were 3× *slower*
+  than no compression; a fused kernel recovered most of that; packing each
+  layer into one buffer (one copy and one kernel per layer, instead of about 100
+  small ops) made compression a net win.
+
+### Projection: 20B model on a 10 GB GPU (no quantization)
+
+About 32 GB has to stream per token (24 GB with the lossless format):
+
+| PCIe link | FP16 streaming | lossless 12-bit | + Wanda 25% (~9 bits, 1.04× ppl) |
+|---|---|---|---|
+| gen3 x16 (~11 GB/s, like the T4) | ~2.9 s/token | ~2.2 s/token | ~1.6 s/token |
+| gen4 x16 (~25 GB/s, RTX 30/40) | ~1.3 s/token | ~1.0 s/token | ~0.7 s/token |
+
+These are per decoding step, so batch 8 gives about 8× the tokens/s. System RAM
+must hold the streamed part: ~24 GB in the lossless format.
+
+## 4. Putting it together for a 20B model (40 GB BF16)
 
 | recipe | bits/weight | 20B size | quality |
 |---|---|---|---|
@@ -77,10 +140,15 @@ per token, which makes this practical at interactive speed.
 
 ## Next steps
 
-1. Repeat on a larger model (1.5B / 7B) to confirm pruning gets cheaper with size.
-2. Write a GPU kernel that decodes the Huffman exponents on the fly inside
-   the matrix multiply, so compressed weights never decompress in VRAM.
-3. Build the offload loop (prefetch layer N+1 while computing N) on top of
-   the compressed format, and benchmark it on a real GPU (Kaggle T4 capped to 10 GB).
+1. **Stream pruned weights.** Store only the kept weights (bitmap + lossless
+   values) so Wanda-pruned layers move ~45% fewer bytes. This is the biggest
+   remaining speed-up for a dense model.
+2. **Mixture-of-Experts.** Stream only the experts a token routes to
+   (gpt-oss-20b moves ~3.6B of 21B parameters per token), so 10–20× less data.
+3. Speculative decoding: one pass over the weights verifies several draft
+   tokens, which multiplies tokens per step.
+4. Move compression to the GPU at load time (it took 4 min on Kaggle's CPU for 7B).
 
-Reproduce: `python lossless.py` (≈1 min) and `python lossy.py` (≈10 min on 4 CPUs).
+Reproduce: `python lossless.py` (≈1 min) and `python lossy.py` (≈10 min on 4 CPUs)
+locally; on a GPU machine `python kaggle/prune_eval.py Qwen/Qwen2.5-7B` and
+`python kaggle/offload_bench.py Qwen/Qwen2.5-7B 0.25 comp 1 8`. Logs are in `kaggle/logs/`.

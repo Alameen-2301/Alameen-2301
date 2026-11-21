@@ -1,0 +1,21 @@
+# Qwen2.5-7B (14.19 GB fp16), GPU budget 25% = 3.55 GB, Kaggle Tesla T4 (PCIe gen3)
+# command: python offload_bench.py Qwen/Qwen2.5-7B 0.25 {raw,comp,accel} 1 8
+=== raw
+PCIe host->GPU: 11.3 GB/s
+raw {"total_gb": 14.19, "budget_gb": 3.55, "resident": 2, "streamed": 26, "layer_gb": 0.43, "pcie_gb_per_token": 11.29, "build_s": 40, "gpu_alloc_gb": 2.75}
+raw batch=  1: 32 steps in   33.7s ->  1.055 s/step,    0.95 tokens/s, peak GPU 2.77 GB
+raw batch=  8: 32 steps in   33.8s ->  1.058 s/step,    7.56 tokens/s, peak GPU 2.80 GB
+sample: ' with the invention of the point-contact transistor in 1947 by John Bardeen and Walter Brattain at Bell Labs in Murray Hill, New Jersey'
+=== comp
+PCIe host->GPU: 10.2 GB/s
+comp {"total_gb": 14.19, "budget_gb": 3.55, "resident": 2, "streamed": 26, "layer_gb": 0.43, "pcie_gb_per_token": 8.47, "build_s": 235, "gpu_alloc_gb": 3.41}
+comp batch=  1: 32 steps in   29.0s ->  0.907 s/step,    1.10 tokens/s, peak GPU 3.42 GB
+comp batch=  8: 32 steps in   29.1s ->  0.908 s/step,    8.81 tokens/s, peak GPU 3.46 GB
+sample: ' with the invention of the point-contact transistor in 1947 by John Bardeen and Walter Brattain at Bell Labs in Murray Hill, New Jersey'
+7B raw vs comp tokens identical: True
+=== accel
+PCIe host->GPU: 10.1 GB/s
+accel {"total_gb": 14.19, "budget_gb": 3.55, "build_s": 75, "gpu_alloc_gb": 2.32}
+accel batch=  1: 32 steps in   95.2s ->  2.974 s/step,    0.34 tokens/s, peak GPU 3.35 GB
+accel batch=  8: 32 steps in   93.4s ->  2.919 s/step,    2.74 tokens/s, peak GPU 3.37 GB
+sample: ' with the invention of the point-contact transistor in 1947 by John Bardeen and Walter Brattain at Bell Labs in Murray Hill, New Jersey'
